@@ -1,189 +1,122 @@
-# GSA MCP Hackathon — Server Template
+# Watershed Evidence MCP
 
-A ready-to-run starter for building a [Model Context Protocol (MCP)](https://modelcontextprotocol.io) server in Python, plus deployment kits for **IBM Cloud (watsonx Orchestrate)** and **Databricks**.
+A provenance-first Model Context Protocol (MCP) server for public U.S. water-quality evidence.
 
-Built with [FastMCP](https://github.com/jlowin/fastmcp) and [uv](https://docs.astral.sh/uv/). If you have never built an MCP server before, start with **[QUICKSTART.md](QUICKSTART.md)**.
+It helps an AI client answer bounded questions about a **river, watershed, or area** by separating four distinct evidence types:
 
----
+1. Raw monitoring observations from the Water Quality Portal (WQP).
+2. Monitoring-location coverage and availability summaries from WQP.
+3. EPA Freshwater Explorer curated/modelled screening context.
+4. Assessment context from EPA ATTAINS.
 
-## What is an MCP server?
+> **Disclaimer:** This is a hackathon prototype. It has not been reviewed or approved by the U.S. EPA, and the views expressed are the author's own, not the position or policy of the agency. Outputs are public-data retrieval, not regulatory determinations.
 
-An MCP server exposes **tools** (functions the model can call), **prompts** (reusable conversation starters), and **resources** (data the model can read) to an AI client such as Claude Desktop, Claude Code, or an agent platform like watsonx Orchestrate. You write the tools; the client's model decides when to call them.
+This is an exploratory prototype for the [GSA MCP Server and AI Agent Government Hackathon](https://www.gsa.gov/artificial-intelligence/ai-community-of-practice/events-and-training/mcp-server-and-ai-agent-government-hackathon). It only calls public data services and performs no writes.
 
-This template gives you a working server with one example of each, so you can replace the examples with your own service and deploy.
+## Why not WQX Web?
 
----
+WQX Web's API supports authenticated data-submission workflows. Public retrieval belongs in the Water Quality Portal. This server intentionally does **not** expose WQX submission APIs.
 
-## Repo structure
+## Tool flow
 
-```
-mcp-hackathon-template/
-├── README.md                  # This file
-├── QUICKSTART.md              # 5-minute clone → run → connect walkthrough
-├── main.py                    # Local entry point (uv run python main.py)
-├── pyproject.toml             # Package + dependencies (uv)
-├── requirements.txt           # Mirror of runtime deps (for buildpack hosts)
-├── Dockerfile                 # Container image (streamable-HTTP, port 8080)
-├── manifest.yaml              # cloud.gov (Cloud Foundry) deploy
-├── server.json                # MCP registry metadata
-├── .env.example               # Copy to .env for local dev
-├── .github/workflows/ci.yml   # Lint + test on push/PR
-├── docs/                      # Vendor-contributed reference materials
-├── src/
-│   └── example_server/        # ← rename to your service
-│       ├── app.py             # Thin entry point: builds FastMCP, picks transport
-│       ├── config.py          # Settings from env vars / .env
-│       ├── models.py          # Pydantic models & enums for tool params
-│       ├── utils.py           # Shared helpers (HTTP client, pagination)
-│       ├── routes.py          # HTTP-only routes (/health, /version)
-│       ├── tools/             # ONE FILE PER TOOL
-│       │   ├── __init__.py    #   register_tools(mcp) aggregator
-│       │   └── example_tool.py
-│       ├── prompts/
-│       │   ├── __init__.py    #   register_prompts(mcp) aggregator
-│       │   └── example.py
-│       └── resources/
-│           ├── __init__.py    #   register_resources(mcp) aggregator
-│           └── example.py
-├── tests/                     # Import + registration smoke tests
-├── eval/                      # Stub → build a Phoenix eval harness (see mcp-eval skill)
-└── deploy/
-    ├── README.md              # Which deployment kit to use
-    ├── ibm/                   # watsonx Orchestrate: 3 kits (see below)
-    └── databricks/            # Databricks Apps kit
+```text
+resolve_waterbody → wqp_available_data → wqp_monitoring_sites → wqp_measurements → wqp_measurements_page
+                                      ↘ freshwater_screening_baseline               (complete collection)
+wqp_vocab_search ──→ exact characteristic name, supplied to wqp_measurements
+two box corners → resolve_watershed → HUC8 → (any wqp_* huc8 scope)
+                                    ↘ HUC12 → get_assessment_context
+assessment-unit ID or HUC12 ───────────────→ get_assessment_context
 ```
 
----
+### Start from a place you know
 
-## Getting started
+If you know where the river is but not what it is called, drag a box around it and send two opposite corners to `resolve_watershed`:
 
-### Prerequisites
-- [uv](https://docs.astral.sh/uv/) — `pip install uv` or `brew install uv`
+```json
+{"name":"resolve_watershed","arguments":{"corner_1":{"latitude":39.30,"longitude":-84.20},"corner_2":{"latitude":39.10,"longitude":-84.40},"level":"huc8"}}
+```
 
-### Install and run
+The corners can be in any order. The tool returns the USGS Watershed Boundary Dataset units that intersect the box (HUC12 by default, HUC8 with `level`), with each unit's name, area, and states, up to 50 (a truncation warning appears beyond that). A box that straddles a watershed boundary returns every unit it touches; you choose one. Boxes are limited to 0.5° per side, so a box crossing the antimeridian is rejected, and a flat box (both corners on one latitude or longitude) is rejected too. The result is a lookup aid: intersecting a box does not mean a river or station lies inside the watershed.
+
+The server uses the summary endpoint before raw-result retrieval. `wqp_measurements` requires a specific characteristic plus a bounded date range and either selected sites, a bounding box, or a point/radius. Use `wqp_vocab_search` to translate a user phrase into an exact WQP controlled-vocabulary value before supplying it to `wqp_measurements`.
+
+## Run locally
 
 ```bash
+uv sync --all-groups
 cp .env.example .env
-uv sync
-uv run python main.py
+# Set ATTAINS_API_KEY in .env if you will use assessment-context retrieval.
+uv run watershed-evidence-mcp
 ```
 
-The server starts in **stdio** mode — it talks JSON-RPC over stdin/stdout, which is how local clients (Claude Desktop, Claude Code) launch it. See [QUICKSTART.md](QUICKSTART.md) to connect a client.
+The server follows the standard Python `.env` convention through `python-dotenv`: it loads **only** a `.env` file in its current working directory, without overriding values already exported by the host environment. The example MCP command uses `uv --directory` so the repository is the working directory. Keep `.env` local; it is ignored by Git. `.env.example` contains only the variable names required for local setup.
 
-### Verify
+Use an MCP client configured for stdio, for example:
+
+```json
+{
+  "mcpServers": {
+    "watershed-evidence": {
+      "command": "uv",
+      "args": ["--directory", "/absolute/path/to/watershed-mcp", "run", "watershed-evidence-mcp"]
+    }
+  }
+}
+```
+
+## Remote (HTTP) mode
+
+Set `PORT` (or `MCP_TRANSPORT=streamable-http`, optionally `MCP_HOST`/`MCP_PORT`) to serve MCP at `/mcp` with a `/health` check; otherwise the server uses stdio. A stray `PORT` exported in your shell switches a local run to HTTP; unset it for stdio clients. Without `PORT`, HTTP mode binds `127.0.0.1` unless `MCP_HOST` is set. The `Dockerfile` builds this mode. The endpoint is unauthenticated; see [`SECURITY.md`](SECURITY.md). The server also exposes an `investigate_waterbody` prompt (the recommended evidence workflow) and `watershed://evidence-types` / `watershed://caveats` resources.
+
+## Hackathon demo
+
+The presentation-grade Little Miami River near Milford flow is documented in
+[`docs/little-miami-demo.md`](docs/little-miami-demo.md). It includes a reproducible
+MCP client script, explicit river-name disambiguation, bounded source queries,
+evidence labels, failure behavior, and reset instructions.
 
 ```bash
-uv sync --group dev
-uv run pytest tests/ -v      # tests
-uv run ruff check .          # lint
+uv run python scripts/run_little_miami_demo.py
 ```
 
----
+## Guardrails
 
-## The one-tool-per-file pattern
+- Every successful upstream response includes query URL(s), retrieval timestamp, source/version, and a data-use caveat.
+- It never labels a screening baseline as a regulatory conclusion.
+- It does not infer a river corridor from a name alone: `resolve_waterbody` returns candidates and the caller must choose one.
+- `resolve_watershed` takes two opposite corners (latitude/longitude, any order; each side at most 0.5°) and returns the USGS WBD HUC8 or HUC12 units that intersect the box. Intersection is not containment; a box that straddles several watersheds returns all of them and the caller must choose. Malformed upstream records (a missing, non-numeric, or wrong-length code) are skipped and counted in `skipped_records`, with a warning that the list may be incomplete.
+- It preserves original identifiers, units, qualifiers, and source fields.
+- `wqp_measurements` uses a local DuckDB cache keyed by normalized parameters, endpoint, source, and source version. Entries have a one-hour TTL; expired entries are deleted on lookup, and a source-version change creates a distinct cache key.
+- ATTAINS calls require a free Data.gov API key supplied at runtime as `ATTAINS_API_KEY`; the adapter sends it only as the documented `X-Api-Key` header, never embeds or logs it, and never includes it in returned provenance URLs. It resolves each requested assessment unit through ATTAINS to obtain authoritative organization IDs before retrieving assessment decisions, rather than inferring a state from an identifier prefix. HUC12 retrieval remains bounded to 50 resolved organization/unit pairs. Missing configuration fails before a network request with the registration URL.
+- ATTAINS responses describe a reporting cycle and are context only; they do not establish current condition or prove a cause.
+- It caps results and labels every cap-reached response `truncated: true` (WQP and `freshwater_screening_baseline` both report `truncated` and `requested_max_records`); WQP results have no stable cursor here, so the continuation strategy is to narrow date range, station IDs, or characteristics before requesting the next slice.
+- Upstream requests use a 20-second timeout, a 10 MB response limit, and expected-content-type checks. Service failures name the safe corrective action without exposing a traceback.
+- WQX 3 is the default compatibility mode: it queries the `basicPhysChem` profile at `https://www.waterqualitydata.us/wqx3/`. `compatibility_mode="wqx2"` selects the legacy WQX 2 service, which no longer receives USGS data added after early 2024. Both modes return the same record keys; values are passed through untranslated, so vocabularies can differ (for example sample fraction `Total` in WQX 2 vs `Unfiltered` in WQX 3) and must not be merged as equivalent. WQX 3 has no laboratory name in this profile (`laboratory_name: null`).
+- `wqp_monitoring_sites` reads the WQX 3 Station service (CSV converted to GeoJSON). Properties keep WQX 3 column names such as `Location_Identifier`, `Location_Type`, and `Location_HUCTwelveDigitCode`; geometry uses WQP's standardized NAD83 coordinates and is null when they are missing.
+- `wqp_measurements`, `wqp_measurements_page`, and `wqp_monitoring_sites` take `compatibility_mode` (`wqx3` default, `wqx2` legacy). The agent chooses it explicitly; the server never switches modes or falls back. Use `wqx2` only to reproduce an earlier WQX 2 result, to compare with prior work in WQX 2 vocabulary, or when `laboratory_name` is required. `wqp_monitoring_sites` in `wqx2` mode returns the legacy GeoJSON with per-station counts.
+- `wqp_available_data` still uses the WQX 2 summary service because WQX 3 has no summary endpoint. Its counts exclude USGS data added after early 2024 and are a lower bound; each response includes a `coverage_note` saying so.
+- Records keep `sample_fraction`, `result_status`, `activity_type`, `usgs_pcode`, `provider_name`, and detection limits. WQX 3 has two detection-limit slots, kept as `detection_limit_*` (A) and `detection_limit_b_*` (B); neither is preferred. In WQX 2 the `detection_limit_b_*` fields are always null because that profile has only one slot, not because no second limit exists.
+- `resolve_waterbody` candidates include `huc8`, the first 8 digits of the NHD reachcode. It is the whole subbasin containing the reach, far wider than the river itself; use it as a WQP `huc8` scope only when that breadth is intended.
 
-Each tool lives in its own file under `src/example_server/tools/` and exposes a `register(mcp)` function. `tools/__init__.py` calls each one from a single `register_tools(mcp)`. This keeps the tool list scannable and lets you add or remove an integration by touching two files.
+## Official sources
 
-**Step 1 — create `src/example_server/tools/my_tool.py`:**
+- [WQP Web Services Guide](https://www.waterqualitydata.us/webservices_documentation/)
+- [WQP modernization / WQX 3 reference](https://www.epa.gov/waterdata/water-quality-portal-modernization-quick-reference-guide)
+- [EPA Freshwater Explorer](https://www.epa.gov/water-research/freshwater-explorer)
+- [EPA ATTAINS Web Services](https://www.epa.gov/waterdata/how-access-and-use-attains-web-services)
+- [USGS Watershed Boundary Dataset MapServer](https://hydro.nationalmap.gov/arcgis/rest/services/wbd/MapServer)
+- [EPA WATERS GeoViewer surface-water layer](https://watersgeo.epa.gov/arcgis/rest/services/OWOTHER/WATERS_GeoViewer_SurfaceWater/MapServer/1)
 
-```python
-from typing import Annotated
-from urllib.parse import quote
-from fastmcp import FastMCP
+## Current scope
 
-from example_server.utils import fetch_json
+The server supports WQP public station summaries, station inventory, exact-characteristic measurement retrieval (bounded sample or complete paged collection), vocabulary discovery, river-name candidate resolution, box-to-watershed (HUC8/HUC12) resolution, Freshwater Explorer screening layers, and ATTAINS assessment context.
 
+### Bounded sample vs. complete collection
 
-def register(mcp: FastMCP) -> None:
-    @mcp.tool(
-        name="example_get_thing",
-        annotations={
-            "title": "Get a thing",
-            "readOnlyHint": True,
-            "destructiveHint": False,
-            "idempotentHint": True,
-            "openWorldHint": True,
-        },
-    )
-    async def get_thing(thing_id: Annotated[str, "The ID to fetch."]) -> dict:
-        """One-line summary. Document the data source, its update cadence,
-        and the return shape here — the model reads this docstring."""
-        safe_id = quote(thing_id, safe="")
-        return await fetch_json(f"things/{safe_id}")
-```
+- `wqp_measurements` is a **bounded exploratory sample**: at most `result_limit` rows, `truncated: true` when the cap is reached. Never present it as a complete dataset.
+- `wqp_measurements_page` retrieves a **complete, explicitly defined collection** (stations/area, exact characteristics, date range) as contiguous date-window pages. WQP has no stable cursor and unsorted results, so completeness is established per window: a window is returned only if the source gave fewer rows than `result_limit`; otherwise the window is halved (at most 12 upstream requests per call). A single day that still hits the cap raises an error rather than dropping records.
+- Call with no `continuation_token`, then pass each `collection.continuation_token` back (same query) until it is `null` (`final_page: true`). The collection is complete only if every page was retrieved; windows tile `declared_range` with no gaps, and `query_id` identifies the query. Invalid, foreign, or out-of-range tokens are rejected. Records stay raw (units, qualifiers, detection limits, methods) and per-page provenance is preserved. Pages are cached for one hour, so a collection can differ if the source changes between calls.
 
-**Step 2 — wire it up in `tools/__init__.py`:**
+`freshwater_screening_baseline` takes a `layer`: `predicted_conductivity` (default; stream reaches, `id` = `COMID`), or the station point layers `station_water_chemistry_10th_percentile` (pH, DOC, hardness), `station_aluminum_criteria`, and `station_cadmium_criteria` (calculated acute/chronic criteria; `id` = WQP station ID). Criteria layers carry their own caveat: they are screening values, not adopted standards, exceedances, or impairment findings. Every layer is returned as a GeoJSON `feature_collection` (EPSG:4326, attributes in `properties`) alongside `bounding_box`, `truncated`, and `records_without_geometry`. Rendering is out of scope for this server: a client or agent can pass `feature_collection` to its own plotting stack (for example geopandas, `sf`, or Leaflet) and should label the output as modelled screening context, not observations or an impairment finding. Do not infer completeness from the record count; use `truncated`.
 
-```python
-from example_server.tools import example_tool, my_tool
-
-def register_tools(mcp) -> None:
-    example_tool.register(mcp)
-    my_tool.register(mcp)  # ← add this line
-```
-
-**Step 3 — add any API key** as a typed field in `config.py` and document the env var in `.env.example`.
-
-Prompts (`prompts/`) and resources (`resources/`) follow the exact same `register(mcp)` + aggregator pattern.
-
----
-
-## Rename the package
-
-Before publishing your server, rename `example_server` to your service (e.g. `census_mcp`):
-
-1. Rename the folder `src/example_server/` → `src/<your_name>/`.
-2. Update `pyproject.toml`: the `[project].name`, `[project.scripts]`, and `[tool.hatch.build.targets.wheel].packages`.
-3. Find-and-replace `example_server` across `src/`, `tests/`, `main.py`, `Dockerfile`, and `manifest.yaml`.
-
----
-
-## Tool design tips (federal data)
-
-- **Return structured data, not prose.** Return dicts/lists with consistent keys and let the model narrate.
-- **Document freshness.** Federal datasets lag; state the update frequency and "as-of" date in the docstring.
-- **Expose pagination.** Use `PaginationParams` / `paginate()` from `utils.py`, and return `has_more` / `next_offset`.
-- **Use explicit timeouts.** `utils.fetch_json` defaults to 30s.
-- **Actionable errors.** Return an error dict with a `hint`, not a raw stack trace.
-- **Constrain outbound requests.** Keep API origins in operator-controlled code or configuration, pass only validated relative paths to `fetch_json`, and encode path segments. Never pass a tool-supplied URL directly to an HTTP client.
-- **Treat redirects and DNS as security boundaries.** Redirects are disabled by default. A server that must fetch caller-supplied URLs needs connection-time IP validation on every hop plus network egress controls; a one-time DNS check is not sufficient.
-- **Keep sensitive data out of errors and logs.** Do not expose or log upstream bodies, headers, full URLs, query strings, credentials, stack traces, SSNs, dates of birth, or addresses.
-
----
-
-## Deploying
-
-Local development uses stdio. To share your server with an agent platform, deploy it and register it. See **[deploy/README.md](deploy/README.md)** for a chooser, then:
-
-- **IBM watsonx Orchestrate** — [deploy/ibm/](deploy/ibm/) (three kits: local stdio toolkit, Code Engine build-from-Git, and prebuilt image).
-- **Databricks Apps** — [deploy/databricks/](deploy/databricks/).
-
-Both read the same server code; `app.py` automatically serves HTTP when the platform injects a port.
-
----
-
-## Partner reference materials
-
-The [`docs/`](docs/) directory contains educational reference materials that
-IBM and Databricks may contribute for hackathon participants. Vendor-contributed
-materials do not represent the views, positions, or policies of GSA or the
-United States Government.
-
-GSA does not endorse any commercial product, service, or enterprise referenced
-in these materials. Reference to a commercial product, service, or enterprise
-does not constitute or imply endorsement, recommendation, or favoring by GSA or
-the United States Government. These materials are provided for educational
-purposes only. See [`docs/README.md`](docs/README.md) for the complete notice and
-contribution guidance.
-
----
-
-## Evaluations
-
-Measuring how well an LLM can use your tools is the real test of server quality. This template intentionally does **not** ship an eval harness — see [eval/README.md](eval/README.md) for how to build one with the `mcp-eval` skill.
-
----
-
-## License
-
-[MIT](LICENSE). See [SECURITY.md](SECURITY.md) for the vulnerability disclosure policy and hackathon security notes.
+Freshwater Explorer and ATTAINS adapters are deliberately isolated behind their own modules so service changes do not break WQP retrieval.
