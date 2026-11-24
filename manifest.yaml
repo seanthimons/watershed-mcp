@@ -9,9 +9,13 @@
 #   cf target -o <your-org> -s <your-space>
 #   cf push
 #   cf set-env watershed-evidence-mcp ATTAINS_API_KEY <key>   # optional; never put it here
+#   cf restart watershed-evidence-mcp                         # set-env applies on restart
 #
-# The HTTP endpoint is unauthenticated (see SECURITY.md). Keep one instance: the DuckDB
-# response cache holds a file lock. Rename the route to something unique before pushing.
+# .cfignore keeps .env, .venv/ and other local files out of the upload.
+#
+# The HTTP endpoint is unauthenticated (see SECURITY.md). One instance is enough: each
+# instance keeps its own DuckDB response cache on its own temporary disk. Rename the route
+# to something unique before pushing.
 applications:
   - name: watershed-evidence-mcp
     buildpacks:

@@ -1,0 +1,15 @@
+# Files cf push must not upload to cloud.gov (mirrors .dockerignore). A local .env can hold
+# the ATTAINS key; set it with cf set-env instead.
+.env
+.env.*
+!.env.example
+.venv/
+.git/
+__pycache__/
+.pytest_cache/
+.ruff_cache/
+evaluation-reports/
+dist/
+tests/
+demo/
+uat/
