@@ -1,4 +1,13 @@
-# Partner Reference Materials
+# Documentation and partner reference materials
+
+The project documents in this directory are written by the Watershed Evidence MCP
+author: [`architecture.md`](architecture.md), [`evaluation.md`](evaluation.md),
+[`little-miami-demo.md`](little-miami-demo.md), the presentation deck
+(`Watershed_Evidence_MCP_deck.pptx`) and the evaluation write-up
+(`Watershed_Evidence_MCP_evaluation.md` and `.docx`). The notice below comes from the
+GSA hackathon template and applies only to vendor-contributed materials.
+
+## Partner Reference Materials
 
 This directory contains reference materials contributed by vendor partners for
 participants in the GSA MCP Hackathon. IBM and Databricks may submit materials

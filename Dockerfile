@@ -1,31 +1,17 @@
-# syntax=docker/dockerfile:1
-# Container image for remote (streamable-HTTP) deployment.
-#
-# Used by:
-#   - IBM Code Engine (deploy/ibm/)
-#   - cloud.gov (docker image path) and any other container host
-#
-# The server serves MCP over streamable-HTTP at :8080/mcp with a health check
-# at :8080/health. app.py auto-selects HTTP because PORT is set below.
-
+# Streamable-HTTP image: MCP at :8080/mcp, health at :8080/health.
 FROM python:3.11-slim
 
-ENV PYTHONDONTWRITEBYTECODE=1
-ENV PYTHONUNBUFFERED=1
-ENV PYTHONPATH=/app/src
-ENV PORT=8080
+ENV PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1 PORT=8080 \
+    XDG_CACHE_HOME=/tmp/cache UV_PROJECT_ENVIRONMENT=/opt/venv PATH=/opt/venv/bin:$PATH
+# ponytail: single process only; the DuckDB cache holds a file lock.
 
 WORKDIR /app
-
-# Install uv (fast, reproducible installs).
-COPY --from=ghcr.io/astral-sh/uv:latest /uv /usr/local/bin/uv
-
-# Install dependencies first for better layer caching.
-COPY pyproject.toml README.md ./
+COPY --from=ghcr.io/astral-sh/uv:0.8 /uv /usr/local/bin/uv
+COPY pyproject.toml uv.lock README.md ./
 COPY src ./src
-RUN uv pip install --system --no-cache .
+RUN uv sync --locked --no-dev --no-cache && useradd -r app
+USER app
 
 EXPOSE 8080
-
-# PORT=8080 (set above) makes app.py run HTTP on that port automatically.
-CMD ["python", "-m", "example_server.app"]
+# Supply ATTAINS_API_KEY at runtime; never bake it into the image.
+CMD ["python", "-m", "watershed_evidence_mcp.server"]

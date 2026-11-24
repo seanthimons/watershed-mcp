@@ -1,0 +1,417 @@
+"""Read-only adapter for Water Quality Portal public web services."""
+
+from __future__ import annotations
+
+import base64
+import csv
+import hashlib
+import json
+import os
+from collections.abc import Mapping
+from dataclasses import dataclass
+from datetime import date, datetime, timedelta
+from io import StringIO
+from pathlib import Path
+from urllib.parse import urlencode
+
+from watershed_evidence_mcp.cache import DuckDbCache
+from watershed_evidence_mcp.http import JsonHttpClient, UpstreamServiceError
+from watershed_evidence_mcp.models import CompatibilityMode, QueryScope, WqpQuery
+
+WQP_BASE_URL = "https://www.waterqualitydata.us/data"
+WQX3_BASE_URL = "https://www.waterqualitydata.us/wqx3"
+WQP_SOURCE = "Water Quality Portal"
+WQX2_VERSION = "WQX 2 public web services"
+WQX3_VERSION = "WQX 3 public web services (basicPhysChem profile)"
+# Bump when normalized record keys change so cached rows with the old shape are not served.
+RECORD_SCHEMA = "2"
+# Identifier and characteristic columns each mode must return on every row.
+REQUIRED_RESULT_COLUMNS = {
+    "wqx2": ("MonitoringLocationIdentifier", "CharacteristicName"),
+    "wqx3": ("Location_Identifier", "Result_Characteristic"),
+}
+CACHE_PATH = (
+    Path(os.environ.get("XDG_CACHE_HOME", Path.home() / ".cache"))
+    / "watershed-evidence-mcp"
+    / "wqp.duckdb"
+)
+
+
+@dataclass(frozen=True)
+class MeasurementResult:
+    records: list[dict[str, str | None]]
+    query_url: str
+    source_version: str
+    retrieved_at: datetime
+    cache_hit: bool
+    truncated: bool
+    continuation: str | None
+
+
+MAX_WINDOW_REQUESTS = 12
+
+
+@dataclass(frozen=True)
+class CollectionPage:
+    """One complete date window of a defined collection, plus how to fetch the next one."""
+
+    result: MeasurementResult
+    query_id: str
+    window_start: date
+    window_end: date
+    continuation_token: str | None
+
+
+def query_id(query: WqpQuery) -> str:
+    return hashlib.sha256(query.model_dump_json().encode()).hexdigest()[:16]
+
+
+def _encode_token(qid: str, start: date, span_days: int) -> str:
+    raw = json.dumps({"q": qid, "s": start.isoformat(), "d": span_days}, separators=(",", ":"))
+    return base64.urlsafe_b64encode(raw.encode()).decode()
+
+
+def _decode_token(token: str, query: WqpQuery) -> tuple[date, int]:
+    try:
+        data = json.loads(base64.urlsafe_b64decode(token.encode()))
+        start, span = date.fromisoformat(data["s"]), int(data["d"])
+        qid = data["q"]
+    except (ValueError, KeyError, TypeError) as exc:
+        raise ValueError("invalid continuation token") from exc
+    if qid != query_id(query):
+        raise ValueError("continuation token belongs to a different query")
+    if not query.start_date <= start <= query.end_date or span < 1:
+        raise ValueError("continuation token is outside the query date range")
+    return start, span
+
+
+class WqpAdapter:
+    """Build bounded WQP requests and retain transparent provenance metadata."""
+
+    def __init__(
+        self, client: JsonHttpClient | None = None, cache: DuckDbCache | None = None
+    ) -> None:
+        self.client = client or JsonHttpClient()
+        self._cache = cache
+
+    @property
+    def cache(self) -> DuckDbCache:
+        """Create persistent state only for a measurement retrieval."""
+        if self._cache is None:
+            self._cache = DuckDbCache(CACHE_PATH)
+        return self._cache
+
+    @staticmethod
+    def _scope_parameters(scope: QueryScope) -> dict[str, str]:
+        if scope.station_ids is not None:
+            return {"siteid": ";".join(scope.station_ids)}
+        if scope.bounding_box is not None:
+            return {"bBox": scope.bounding_box.wqp_value()}
+        if scope.point_radius is not None:
+            return {
+                "lat": str(scope.point_radius.latitude),
+                "long": str(scope.point_radius.longitude),
+                "within": str(scope.point_radius.within_miles),
+            }
+        if scope.huc8 is not None:
+            return {"huc": scope.huc8}
+        raise ValueError("validated QueryScope had no selector")
+
+    @classmethod
+    def result_parameters(cls, query: WqpQuery) -> dict[str, str]:
+        parameters = cls._scope_parameters(query.scope)
+        parameters.update(
+            {
+                "characteristicName": ";".join(query.characteristic_names),
+                "startDateLo": query.start_date.strftime("%m-%d-%Y"),
+                "startDateHi": query.end_date.strftime("%m-%d-%Y"),
+                "sampleMedia": query.sample_media,
+                "mimeType": "csv",
+                "zip": "no",
+                "sorted": "no",
+                "resultLimit": str(query.result_limit),
+            }
+        )
+        if query.compatibility_mode == "wqx3":
+            parameters["dataProfile"] = "basicPhysChem"
+        return parameters
+
+    @classmethod
+    def site_parameters(
+        cls, scope: QueryScope, compatibility_mode: CompatibilityMode = "wqx3"
+    ) -> dict[str, str]:
+        parameters = cls._scope_parameters(scope)
+        # WQX 3 Station search serves CSV only; WQX 2 serves GeoJSON directly.
+        mime = "csv" if compatibility_mode == "wqx3" else "geojson"
+        parameters.update({"mimeType": mime, "zip": "no"})
+        return parameters
+
+    @classmethod
+    def summary_parameters(cls, scope: QueryScope) -> dict[str, str]:
+        parameters = cls._scope_parameters(scope)
+        parameters.update({"mimeType": "geojson", "dataProfile": "summaryMonitoringLocation"})
+        return parameters
+
+    @staticmethod
+    def url(path: str, params: Mapping[str, str], base: str = WQP_BASE_URL) -> str:
+        return f"{base}/{path}?{urlencode(params)}"
+
+    @staticmethod
+    def _version_for(query: WqpQuery) -> str:
+        return WQX3_VERSION if query.compatibility_mode == "wqx3" else WQX2_VERSION
+
+    @classmethod
+    def vocabulary_parameters(cls, text: str, page_size: int, page_number: int) -> dict[str, str]:
+        return {
+            "text": text,
+            "pagesize": str(page_size),
+            "pagenumber": str(page_number),
+            "mimeType": "json",
+        }
+
+    async def vocabulary_search(
+        self, vocabulary: str, text: str, *, page_size: int, page_number: int
+    ) -> tuple[dict, str]:
+        """Search a WQP controlled vocabulary using its case-sensitive endpoint path."""
+        endpoint = f"Codes/{vocabulary.lower()}"
+        params = self.vocabulary_parameters(text, page_size, page_number)
+        url = f"https://www.waterqualitydata.us/{endpoint}"
+        query_url = f"{url}?{urlencode(params)}"
+        try:
+            return await self.client.get_json(url, params), query_url
+        except UpstreamServiceError as exc:
+            raise UpstreamServiceError(
+                f"WQP controlled-vocabulary search failed for {vocabulary}: {exc}"
+            ) from exc
+
+    async def available_data(self, scope: QueryScope) -> tuple[dict, str]:
+        params = self.summary_parameters(scope)
+        url = f"{WQP_BASE_URL}/summary/monitoringLocation/search"
+        query_url = self.url("summary/monitoringLocation/search", params)
+        return await self.client.get_json(url, params), query_url
+
+    async def monitoring_sites(
+        self, scope: QueryScope, compatibility_mode: CompatibilityMode = "wqx3"
+    ) -> tuple[dict, str]:
+        """Station inventory as GeoJSON; WQX 3 rows are converted with NAD83 standardized coords."""
+        params = self.site_parameters(scope, compatibility_mode)
+        if compatibility_mode == "wqx2":
+            url = f"{WQP_BASE_URL}/Station/search"
+            return await self.client.get_json(url, params), self.url("Station/search", params)
+        url = f"{WQX3_BASE_URL}/Station/search"
+        text = await self.client.get_text(
+            url, params, expected_content_types=("text/csv", "application/csv", "text/plain")
+        )
+        reader = csv.DictReader(StringIO(text))
+        if reader.fieldnames is None or "Location_Identifier" not in reader.fieldnames:
+            raise UpstreamServiceError(
+                "WQP returned station CSV without Location_Identifier; retry later"
+            )
+        features = [station_feature(row) for row in reader]
+        return (
+            {"type": "FeatureCollection", "features": features},
+            self.url("Station/search", params, WQX3_BASE_URL),
+        )
+
+    async def measurements(self, query: WqpQuery) -> MeasurementResult:
+        mode = query.compatibility_mode
+        source_version = self._version_for(query)
+        base = WQX3_BASE_URL if mode == "wqx3" else WQP_BASE_URL
+        normalize = normalize_wqx3_row if mode == "wqx3" else normalize_result_row
+        params = self.result_parameters(query)
+        endpoint = "Result/search"
+        query_url = self.url(endpoint, params, base)
+        cache_key = self.cache.key_for(
+            source=WQP_SOURCE,
+            source_version=source_version,
+            endpoint=f"{base}/{endpoint}",
+            parameters={**params, "_record_schema": RECORD_SCHEMA},
+        )
+        cached = self.cache.get(cache_key)
+        if cached is not None:
+            return self._measurement_result(
+                cached.payload, query_url, source_version, cached.retrieved_at, cache_hit=True
+            )
+
+        url = f"{base}/{endpoint}"
+        text = await self.client.get_text(
+            url,
+            params,
+            expected_content_types=("text/csv", "application/csv", "text/plain"),
+        )
+        required = REQUIRED_RESULT_COLUMNS[mode]
+        reader = csv.DictReader(StringIO(text))
+        if reader.fieldnames is None or not set(required).issubset(reader.fieldnames):
+            raise UpstreamServiceError(
+                "WQP returned CSV without required identifier/characteristic columns; retry later"
+            )
+        rows = list(reader)
+        if any(not all(row.get(column) for column in required) for row in rows):
+            raise UpstreamServiceError(
+                "WQP returned a CSV row without a monitoring-location identifier or "
+                "characteristic; retry later"
+            )
+        normalized = [normalize(row) for row in rows[: query.result_limit]]
+        payload = {
+            "records": normalized,
+            "truncated": len(rows) >= query.result_limit,
+        }
+        entry = self.cache.set(cache_key, payload)
+        return self._measurement_result(
+            payload, query_url, source_version, entry.retrieved_at, cache_hit=False
+        )
+
+    async def collection_page(
+        self, query: WqpQuery, continuation_token: str | None = None
+    ) -> CollectionPage:
+        """Return the next date window whose upstream result is below the cap, so it is complete.
+
+        WQP (WQX 2 and WQX 3) has no stable cursor and unsorted results, so completeness is
+        established per date window: a window is complete only if the source returned fewer
+        rows than the cap.
+        """
+        if continuation_token is None:
+            start, span = query.start_date, (query.end_date - query.start_date).days + 1
+        else:
+            start, span = _decode_token(continuation_token, query)
+        span = min(span, (query.end_date - start).days + 1)
+        for _ in range(MAX_WINDOW_REQUESTS):
+            end = start + timedelta(days=span - 1)
+            result = await self.measurements(
+                query.model_copy(update={"start_date": start, "end_date": end})
+            )
+            if not result.truncated:
+                break
+            if span == 1:
+                raise ValueError(
+                    f"{start} alone has at least result_limit={query.result_limit} records; "
+                    "a single day cannot be split further. Narrow stations or characteristics, "
+                    "or raise result_limit (max 10000)."
+                )
+            span = (span + 1) // 2
+        else:
+            raise ValueError(
+                "could not find a date window under result_limit within the per-call request "
+                "budget; retry with the same continuation token or raise result_limit"
+            )
+        qid = query_id(query)
+        next_start = end + timedelta(days=1)
+        token = _encode_token(qid, next_start, span) if next_start <= query.end_date else None
+        return CollectionPage(result, qid, start, end, token)
+
+    @staticmethod
+    def _measurement_result(
+        payload: dict,
+        query_url: str,
+        source_version: str,
+        retrieved_at: datetime,
+        *,
+        cache_hit: bool,
+    ) -> MeasurementResult:
+        truncated = bool(payload["truncated"])
+        continuation = None
+        if truncated:
+            continuation = (
+                "This response reached the requested result_limit and may be incomplete. WQP "
+                "does not provide a stable result cursor here; narrow the date range, station IDs, "
+                "or characteristic selection before requesting the next bounded slice."
+            )
+        return MeasurementResult(
+            records=payload["records"],
+            query_url=query_url,
+            source_version=source_version,
+            retrieved_at=retrieved_at,
+            cache_hit=cache_hit,
+            truncated=truncated,
+            continuation=continuation,
+        )
+
+
+def station_feature(row: Mapping[str, str]) -> dict:
+    """Keep every WQX 3 station column; geometry is None when standardized coords are absent."""
+    properties = {key: (value or None) for key, value in row.items()}
+    try:
+        lon = float(row["Location_LongitudeStandardized"])
+        lat = float(row["Location_LatitudeStandardized"])
+        geometry = {"type": "Point", "coordinates": [lon, lat]}
+    except (KeyError, TypeError, ValueError):
+        geometry = None
+    return {
+        "type": "Feature",
+        "id": properties.get("Location_Identifier"),
+        "geometry": geometry,
+        "properties": properties,
+    }
+
+
+def normalize_result_row(row: Mapping[str, str]) -> dict[str, str | None]:
+    """Keep WQP’s evidence-bearing fields; do not infer or harmonize units."""
+
+    def value(*names: str) -> str | None:
+        return next((row.get(name) for name in names if row.get(name) not in (None, "")), None)
+
+    return {
+        "organization_id": value("OrganizationIdentifier"),
+        "station_id": value("MonitoringLocationIdentifier"),
+        "activity_date": value("ActivityStartDate"),
+        "activity_time": value("ActivityStartTime/Time", "ActivityStartTime"),
+        "characteristic_name": value("CharacteristicName"),
+        "value": value("ResultMeasureValue", "ResultValue"),
+        "unit": value("ResultMeasure/MeasureUnitCode", "ResultMeasure.MeasureUnitCode"),
+        "value_type": value("ResultValueTypeName"),
+        "qualifier": value("MeasureQualifierCode", "ResultQualifier"),
+        "detection_condition": value("ResultDetectionConditionText"),
+        "detection_limit_value": value("DetectionQuantitationLimitMeasure/MeasureValue"),
+        "detection_limit_unit": value("DetectionQuantitationLimitMeasure/MeasureUnitCode"),
+        "method_identifier": value(
+            "ResultAnalyticalMethod/MethodIdentifier", "AnalyticalMethod/MethodIdentifier"
+        ),
+        "laboratory_name": value("LaboratoryName"),
+        "sample_fraction": value("ResultSampleFractionText"),
+        "result_status": value("ResultStatusIdentifier"),
+        "activity_type": value("ActivityTypeCode"),
+        "usgs_pcode": value("USGSPCode"),
+        "provider_name": value("ProviderName"),
+        "detection_limit_type": value("DetectionQuantitationLimitTypeName"),
+        # WQX 2's Result profile has one detection-limit slot; None means "no slot", not "none".
+        "detection_limit_b_type": None,
+        "detection_limit_b_value": None,
+        "detection_limit_b_unit": None,
+    }
+
+
+def normalize_wqx3_row(row: Mapping[str, str]) -> dict[str, str | None]:
+    """Map WQX 3 basicPhysChem columns onto the same keys; values pass through untranslated.
+
+    WQX 3 vocabulary can differ from WQX 2 (e.g. sample fraction "Unfiltered" vs "Total").
+    Both detection-limit slots (A and B) are kept; neither is preferred.
+    """
+
+    def value(name: str) -> str | None:
+        return row.get(name) or None
+
+    return {
+        "organization_id": value("Org_Identifier"),
+        "station_id": value("Location_Identifier"),
+        "activity_date": value("Activity_StartDate"),
+        "activity_time": value("Activity_StartTime"),
+        "characteristic_name": value("Result_Characteristic"),
+        "value": value("Result_Measure"),
+        "unit": value("Result_MeasureUnit"),
+        "value_type": value("Result_MeasureType"),
+        "qualifier": value("Result_MeasureQualifierCode"),
+        "detection_condition": value("Result_ResultDetectionCondition"),
+        "detection_limit_value": value("DetectionLimit_MeasureA"),
+        "detection_limit_unit": value("DetectionLimit_MeasureUnitA"),
+        "method_identifier": value("ResultAnalyticalMethod_Identifier"),
+        "laboratory_name": None,  # not in the basicPhysChem profile
+        "sample_fraction": value("Result_SampleFraction"),
+        "result_status": value("Result_MeasureStatusIdentifier"),
+        "activity_type": value("Activity_TypeCode"),
+        "usgs_pcode": value("USGSpcode"),
+        "provider_name": value("ProviderName"),
+        "detection_limit_type": value("DetectionLimit_TypeA"),
+        "detection_limit_b_type": value("DetectionLimit_TypeB"),
+        "detection_limit_b_value": value("DetectionLimit_MeasureB"),
+        "detection_limit_b_unit": value("DetectionLimit_MeasureUnitB"),
+    }

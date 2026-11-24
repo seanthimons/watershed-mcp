@@ -1,24 +1,28 @@
 ---
 # cloud.gov (Cloud Foundry) deployment manifest.
 #
-# cloud.gov injects PORT=8080 at runtime; app.py picks that up and serves HTTP.
-# Deploy with the Python buildpack (no Docker needed):
+# cloud.gov injects PORT=8080 at runtime; watershed_evidence_mcp.server picks that up and
+# serves streamable HTTP at /mcp with a /health check. Deploy with the Python buildpack,
+# which installs requirements.txt (no Docker needed):
 #
 #   cf login -a api.fr.cloud.gov --sso
 #   cf target -o <your-org> -s <your-space>
 #   cf push
+#   cf set-env watershed-evidence-mcp ATTAINS_API_KEY <key>   # optional; never put it here
 #
-# Rename the app and route to something unique to you before pushing.
+# The HTTP endpoint is unauthenticated (see SECURITY.md). Keep one instance: the DuckDB
+# response cache holds a file lock. Rename the route to something unique before pushing.
 applications:
-  - name: example-mcp-server
+  - name: watershed-evidence-mcp
     buildpacks:
       - python_buildpack
-    command: PYTHONPATH=src python -m example_server.app
+    command: PYTHONPATH=src python -m watershed_evidence_mcp.server
     health-check-type: http
     health-check-http-endpoint: /health
     env:
       PYTHONUNBUFFERED: 1
     routes:
-      - route: example-mcp-server.app.cloud.gov
+      - route: watershed-evidence-mcp.app.cloud.gov
+    instances: 1
     disk_quota: 1G
-    memory: 256M
+    memory: 512M
